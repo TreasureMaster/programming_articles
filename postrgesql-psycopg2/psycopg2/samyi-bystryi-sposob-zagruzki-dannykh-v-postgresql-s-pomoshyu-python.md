@@ -579,9 +579,197 @@ Memory 0.0
 
 ### Выполнить пакетно (execute\_batch)
 
+В документации psycopg в разделе ["fast execution helpers"](http://initd.org/psycopg/docs/extras.html#fast-execution-helpers) есть очень интересное примечание о выполнении executemany:
+
+> Текущая реализация метода выполнения executemany() (очень мягко говоря) не особенно эффективна. Эти функции можно использовать для ускорения повторного выполнения оператора с набором параметров. Уменьшив количество обращений к серверу, производительность может быть на несколько порядков выше, чем при использовании метода выполнения executemany().
+
+Значит, мы всё время делали всё неправильно!
+
+Функция чуть ниже этого раздела — [execute\_batch](http://initd.org/psycopg/docs/extras.html#psycopg2.extras.execute\_batch):
+
+> Выполняйте группы операторов за меньшее количество обращений к серверу.
+
+Давайте реализуем функцию загрузки с помощью execute\_batch:
+
+```python
+import psycopg2.extras
+
+@profile
+def insert_execute_batch(connection, beers: Iterator[Dict[str, Any]]) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+
+        all_beers = [{
+            **beer,
+            'first_brewed': parse_first_brewed(beer['first_brewed']),
+            'volume': beer['volume']['value'],
+        } for beer in beers]
+
+        psycopg2.extras.execute_batch(cursor, """
+            INSERT INTO staging_beers VALUES (
+                %(id)s,
+                %(name)s,
+                %(tagline)s,
+                %(first_brewed)s,
+                %(description)s,
+                %(image_url)s,
+                %(abv)s,
+                %(ibu)s,
+                %(target_fg)s,
+                %(target_og)s,
+                %(ebc)s,
+                %(srm)s,
+                %(ph)s,
+                %(attenuation_level)s,
+                %(brewers_tips)s,
+                %(contributed_by)s,
+                %(volume)s
+            );
+        """, all_beers)
+```
+
+Выполнение функции:
+
+```python
+>>> insert_execute_batch(connection, beers)
+insert_execute_batch()
+Time   3.917
+Memory 2.50390625
+```
+
+Ух ты! Это огромный скачок. Функция завершилась менее чем за 4 секунды. Это примерно в 33 раза быстрее, чем 129 секунд, с которых мы начали.
+
 ### Выполнить пакетно из итератора (execute\_batch)
 
+Функция execute\_batch использовала меньше памяти, чем executemany для тех же данных. Давайте попробуем освободить память, «передавая» данные в execute\_batch с помощью итератора:
+
+```python
+@profile
+def insert_execute_batch_iterator(connection, beers: Iterator[Dict[str, Any]]) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+
+        iter_beers = ({
+            **beer,
+            'first_brewed': parse_first_brewed(beer['first_brewed']),
+            'volume': beer['volume']['value'],
+        } for beer in beers)
+
+        psycopg2.extras.execute_batch(cursor, """
+            INSERT INTO staging_beers VALUES (
+                %(id)s,
+                %(name)s,
+                %(tagline)s,
+                %(first_brewed)s,
+                %(description)s,
+                %(image_url)s,
+                %(abv)s,
+                %(ibu)s,
+                %(target_fg)s,
+                %(target_og)s,
+                %(ebc)s,
+                %(srm)s,
+                %(ph)s,
+                %(attenuation_level)s,
+                %(brewers_tips)s,
+                %(contributed_by)s,
+                %(volume)s
+            );
+        """, iter_beers)
+```
+
+Выполнение функции
+
+```python
+>>> insert_execute_batch_iterator(connection, beers)
+insert_execute_batch_iterator()
+Time   4.333
+Memory 0.2265625
+```
+
+Получили примерно то же время, но с меньшим объемом памяти.
+
 ### Выполнение пакетно из итератора с размером страницы (execute\_batch)
+
+Когда я читал [документацию по execute\_batch](http://initd.org/psycopg/docs/extras.html#psycopg2.extras.execute\_batch), мне в глаза бросился аргумент page\_size:
+
+> page\_size – максимальное количество элементов списка аргументов, которые можно включить в каждый оператор. Если элементов больше, функция выполнит более одного оператора.
+
+Ранее в документации указывалось, что функция работает лучше, поскольку она меньше обращается к базе данных. В этом случае больший размер страницы должен уменьшить количество обращений туда и обратно и привести к более быстрому времени загрузки.
+
+Давайте добавим в нашу функцию аргумент размера страницы, чтобы мы могли поэкспериментировать:
+
+```python
+@profile
+def insert_execute_batch_iterator(
+    connection,
+    beers: Iterator[Dict[str, Any]],
+    page_size: int = 100,
+) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+
+        iter_beers = ({
+            **beer,
+            'first_brewed': parse_first_brewed(beer['first_brewed']),
+            'volume': beer['volume']['value'],
+        } for beer in beers)
+
+        psycopg2.extras.execute_batch(cursor, """
+            INSERT INTO staging_beers VALUES (
+                %(id)s,
+                %(name)s,
+                %(tagline)s,
+                %(first_brewed)s,
+                %(description)s,
+                %(image_url)s,
+                %(abv)s,
+                %(ibu)s,
+                %(target_fg)s,
+                %(target_og)s,
+                %(ebc)s,
+                %(srm)s,
+                %(ph)s,
+                %(attenuation_level)s,
+                %(brewers_tips)s,
+                %(contributed_by)s,
+                %(volume)s
+            );
+        """, iter_beers, page_size=page_size)
+```
+
+Размер страницы по умолчанию — 100. Давайте сравним разные значения и результаты:
+
+```python
+>>> insert_execute_batch_iterator(connection, iter(beers), page_size=1)
+insert_execute_batch_iterator(page_size=1)
+Time   130.2
+Memory 0.0
+
+>>> insert_execute_batch_iterator(connection, iter(beers), page_size=100)
+insert_execute_batch_iterator(page_size=100)
+Time   4.333
+Memory 0.0
+
+>>> insert_execute_batch_iterator(connection, iter(beers), page_size=1000)
+insert_execute_batch_iterator(page_size=1000)
+Time   2.537
+Memory 0.2265625
+
+>>> insert_execute_batch_iterator(connection, iter(beers), page_size=10000)
+insert_execute_batch_iterator(page_size=10000)
+Time   2.585
+Memory 25.4453125
+```
+
+Мы получили некоторые интересные результаты, давайте разберем их:
+
+* 1: Результаты аналогичны результатам, которые мы получили, вставляя строки одну за другой.
+* 100: это размер страницы по умолчанию, поэтому результаты аналогичны нашему предыдущему тесту.
+* 1000: Тайминг здесь примерно на 40% быстрее, а памяти мало.
+* 10000: Время не намного быстрее, чем при размере страницы 1000, но объем памяти значительно выше.
+
+Результаты показывают, что существует компромисс между памятью и скоростью. В этом случае кажется, что оптимальным вариантом является размер страницы 1000.
 
 ### Выполнение с значениями (execute\_values)
 
