@@ -272,9 +272,113 @@ def create_staging_table(cursor) -> None:
 
 ### Измерение времени
 
+Для измерения времени для каждого метода мы используем встроенный [модуль time](https://docs.python.org/3/library/time.html):
+
+```python
+>>> import time
+>>> start = time.perf_counter()
+>>> time.sleep(1) # do work
+>>> elapsed = time.perf_counter() - start
+>>> print(f'Time {elapsed:0.4}')
+Time 1.001
+```
+
+Функция [perf\_counter](https://docs.python.org/3/library/time.html#time.perf\_counter) предоставляет часам максимально возможное разрешение, что делает ее идеальной для наших целей.
+
 ### Измерение памяти
 
+Для измерения потребления памяти мы воспользуемся пакетом [memory-profiler](https://pypi.org/project/memory-profiler/).
+
+```bash
+$ python -m pip install memory-profiler
+```
+
+Этот пакет обеспечивает использование памяти и дополнительное использование памяти для каждой строки кода. Это очень полезно при оптимизации памяти. Для иллюстрации это пример, представленный в PyPI:
+
+```bash
+$ python -m memory_profiler example.py
+
+Line #    Mem usage  Increment   Line Contents
+==============================================
+     3                           @profile
+     4      5.97 MB    0.00 MB   def my_func():
+     5     13.61 MB    7.64 MB       a = [1] * (10 ** 6)
+     6    166.20 MB  152.59 MB       b = [2] * (2 * 10 ** 7)
+     7     13.61 MB -152.59 MB       del b
+     8     13.61 MB    0.00 MB       return a
+```
+
+Интересная часть — это столбец Increment, который показывает дополнительную память, выделенную кодом в каждой строке.
+
+В этой статье нас интересует пиковая память, используемая функцией. Пиковый объем памяти — это разница между начальным значением столбца "Mem usage" и максимальным значением (также известным как "high watermark").
+
+Чтобы получить список "Mem usage", мы используем функцию memory\_usage из memory\_profiler:
+
+```python
+>>> from memory_profiler import memory_usage
+>>> mem, retval = memory_usage((fn, args, kwargs), retval=True, interval=1e-7)
+```
+
+При таком использовании функция memory\_usage выполняет функцию fn с предоставленными аргументами args и kwargs, а также запускает другой процесс в фоновом режиме для мониторинга использования памяти каждый inetrval секунд.
+
+Для очень быстрых операций функция fn может выполняться более одного раза. Установив интервал interval  [ниже 1e-6](https://github.com/pythonprofilers/memory\_profiler/blob/0.55/memory\_profiler.py#L350), мы заставляем его выполняться только один раз.
+
+Аргумент retval сообщает функции, что она должна вернуть результат fn.
+
 ### Декоратор profile
+
+Чтобы собрать все это вместе, мы создаем следующий декоратор для измерения и отчета о времени и памяти:
+
+```python
+import time
+from functools import wraps
+from memory_profiler import memory_usage
+
+def profile(fn):
+    @wraps(fn)
+    def inner(*args, **kwargs):
+        fn_kwargs_str = ', '.join(f'{k}={v}' for k, v in kwargs.items())
+        print(f'\n{fn.__name__}({fn_kwargs_str})')
+
+        # Measure time
+        t = time.perf_counter()
+        retval = fn(*args, **kwargs)
+        elapsed = time.perf_counter() - t
+        print(f'Time   {elapsed:0.4}')
+
+        # Measure memory
+        mem, retval = memory_usage(
+            (fn, args, kwargs), retval=True, timeout=200, interval=1e-7
+        )
+
+        print(f'Memory {max(mem) - min(mem)}')
+        return retval
+
+    return inner
+```
+
+Чтобы исключить взаимное влияние таймингов на память и наоборот, мы выполняем функцию дважды. Во-первых, чтобы рассчитать время, во-вторых, чтобы измерить использование памяти.
+
+Декоратор выведет имя функции и все аргументы ключевого слова, а также сообщит об использованном времени и памяти:
+
+```python
+>>> @profile
+>>> def work(n):
+>>>     for i in range(n):
+>>>         2 ** n
+
+>>> work(10)
+work()
+Time   0.06269
+Memory 0.0
+
+>>> work(n=10000)
+work(n=10000)
+Time   0.3865
+Memory 0.0234375
+```
+
+Печатаются только аргументы ключевых слов. Это сделано намеренно, мы собираемся использовать это в параметризованных тестах.
 
 ## Проверка
 
