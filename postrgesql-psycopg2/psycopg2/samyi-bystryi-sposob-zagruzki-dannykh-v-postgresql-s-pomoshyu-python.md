@@ -773,13 +773,331 @@ Memory 25.4453125
 
 ### Выполнение с значениями (execute\_values)
 
+Жемчужины в документации psycopg не заканчиваются на execute\_batch. Просматривая документацию, мое внимание привлекла еще одна функция под названием [execute\_values](http://initd.org/psycopg/docs/extras.html#psycopg2.extras.execute\_values):
+
+> Выполните оператор, используя VALUES с последовательностью параметров.
+
+Функция execute\_values генерирует для запроса огромный список VALUES.
+
+Давайте покрутим:
+
+```python
+import psycopg2.extras
+
+@profile
+def insert_execute_values(connection, beers: Iterator[Dict[str, Any]]) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+        psycopg2.extras.execute_values(cursor, """
+            INSERT INTO staging_beers VALUES %s;
+        """, [(
+            beer['id'],
+            beer['name'],
+            beer['tagline'],
+            parse_first_brewed(beer['first_brewed']),
+            beer['description'],
+            beer['image_url'],
+            beer['abv'],
+            beer['ibu'],
+            beer['target_fg'],
+            beer['target_og'],
+            beer['ebc'],
+            beer['srm'],
+            beer['ph'],
+            beer['attenuation_level'],
+            beer['brewers_tips'],
+            beer['contributed_by'],
+            beer['volume']['value'],
+        ) for beer in beers])
+```
+
+Импорт пива с помощью функции:
+
+```python
+>>> insert_execute_values(connection, beers)
+insert_execute_values()
+Time   3.666
+Memory 4.50390625
+```
+
+Таким образом, прямо из коробки мы получаем небольшое ускорение по сравнению с execute\_batch. Однако памяти немного выше.
+
 ### Выполнение с значениями из итератора (execute\_values)
+
+Как и раньше, чтобы уменьшить потребление памяти, мы стараемся избегать хранения данных в памяти, используя итератор вместо списка:
+
+```python
+@profile
+def insert_execute_values_iterator(connection, beers: Iterator[Dict[str, Any]]) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+        psycopg2.extras.execute_values(cursor, """
+            INSERT INTO staging_beers VALUES %s;
+        """, ((
+            beer['id'],
+            beer['name'],
+            beer['tagline'],
+            parse_first_brewed(beer['first_brewed']),
+            beer['description'],
+            beer['image_url'],
+            beer['abv'],
+            beer['ibu'],
+            beer['target_fg'],
+            beer['target_og'],
+            beer['ebc'],
+            beer['srm'],
+            beer['ph'],
+            beer['attenuation_level'],
+            beer['brewers_tips'],
+            beer['contributed_by'],
+            beer['volume']['value'],
+        ) for beer in beers))
+```
+
+Выполнение функции дало следующие результаты:
+
+```python
+>>> insert_execute_values_iterator(connection, beers)
+insert_execute_values_iterator()
+Time   3.677
+Memory 0.0
+```
+
+Итак, время почти такое же, но память вернулась к нулю.
 
 ### Выполнение с значениями из итератора с размером страницы (execute\_values)
 
+Как и execute\_batch, функция execute\_values также принимает аргумент page\_size:
+
+```python
+@profile
+def insert_execute_values_iterator(
+    connection,
+    beers: Iterator[Dict[str, Any]],
+    page_size: int = 100,
+) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+        psycopg2.extras.execute_values(cursor, """
+            INSERT INTO staging_beers VALUES %s;
+        """, ((
+            beer['id'],
+            beer['name'],
+            beer['tagline'],
+            parse_first_brewed(beer['first_brewed']),
+            beer['description'],
+            beer['image_url'],
+            beer['abv'],
+            beer['ibu'],
+            beer['target_fg'],
+            beer['target_og'],
+            beer['ebc'],
+            beer['srm'],
+            beer['ph'],
+            beer['attenuation_level'],
+            beer['brewers_tips'],
+            beer['contributed_by'],
+            beer['volume']['value'],
+        ) for beer in beers), page_size=page_size)
+```
+
+Выполнение с разными размерами страниц:
+
+```python
+>>> insert_execute_values_iterator(connection, iter(beers), page_size=1)
+insert_execute_values_iterator(page_size=1)
+Time   127.4
+Memory 0.0
+
+>>> insert_execute_values_iterator(connection, iter(beers), page_size=100)
+insert_execute_values_iterator(page_size=100)
+Time   3.677
+Memory 0.0
+
+>>> insert_execute_values_iterator(connection, iter(beers), page_size=1000)
+insert_execute_values_iterator(page_size=1000)
+Time   1.468
+Memory 0.0
+
+>>> insert_execute_values_iterator(connection, iter(beers), page_size=10000)
+insert_execute_values_iterator(page_size=10000)
+Time   1.503
+Memory 2.25
+```
+
+Как и в случае с execute\_batch, мы видим компромисс между памятью и скоростью. Здесь также оптимальный размер страницы составляет около 1000. Однако, используя execute\_values, мы получили результаты примерно на 20% быстрее по сравнению с тем же размером страницы, используя execute\_batch.
+
 ### Копировать (copy\_from)
 
+В официальной документации PostgreSQL есть целый раздел, посвященный [заполнению базы данных](https://www.postgresql.org/docs/current/populate.html#POPULATE-COPY-FROM). Согласно документации, лучший способ загрузить данные в базу данных — использовать [команду copy](https://www.postgresql.org/docs/current/sql-copy.html).
+
+Чтобы использовать копирование copy из Python, psycopg предоставляет специальную функцию [copy\_from](http://initd.org/psycopg/docs/cursor.html#cursor.copy\_from). Для команды копирования copy требуется файл CSV. Давайте посмотрим, сможем ли мы преобразовать наши данные в CSV и загрузить их в базу данных с помощью copy\_from:
+
+```python
+import io
+
+def clean_csv_value(value: Optional[Any]) -> str:
+    if value is None:
+        return r'\N'
+    return str(value).replace('\n', '\\n')
+
+@profile
+def copy_stringio(connection, beers: Iterator[Dict[str, Any]]) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+        csv_file_like_object = io.StringIO()
+        for beer in beers:
+            csv_file_like_object.write('|'.join(map(clean_csv_value, (
+                beer['id'],
+                beer['name'],
+                beer['tagline'],
+                parse_first_brewed(beer['first_brewed']),
+                beer['description'],
+                beer['image_url'],
+                beer['abv'],
+                beer['ibu'],
+                beer['target_fg'],
+                beer['target_og'],
+                beer['ebc'],
+                beer['srm'],
+                beer['ph'],
+                beer['attenuation_level'],
+                beer['contributed_by'],
+                beer['brewers_tips'],
+                beer['volume']['value'],
+            ))) + '\n')
+        csv_file_like_object.seek(0)
+        cursor.copy_from(csv_file_like_object, 'staging_beers', sep='|')
+```
+
+Давайте разберемся:
+
+* clean\_csv\_value: преобразует одно значение.
+  * **Экранирование новых строк**: некоторые текстовые поля содержат символы новой строки, поэтому мы экранируем `\n -> \\n`.
+  * **Пустые значения преобразуются в \N**: строка «\N» — это строка по умолчанию, используемая PostgreSQL для обозначения NULL в COPY (это можно изменить с помощью опции NULL).
+* csv\_file\_like\_object: создайте объект, подобный файлу, с помощью [io.StringIO](https://docs.python.org/3.7/library/io.html?#io.StringIO). Объект StringIO содержит строку, которую можно использовать как файл. В нашем случае это CSV-файл.
+* csv\_file\_like\_object.write: Преобразовать пиво в строку CSV.
+  * **Преобразование данных**: здесь выполняются преобразования first\_brewed и valume.
+  * **Выберите разделитель**: некоторые поля в наборе данных содержат произвольный текст с запятыми. Чтобы предотвратить конфликты, мы выбираем `«|»` в качестве разделителя (другой вариант — использовать QUOTE).
+
+Теперь давайте посмотрим, окупилась ли вся эта тяжелая работа:
+
+```python
+>>> copy_stringio(connection, beers)
+copy_stringio()
+Time   0.6274
+Memory 99.109375
+```
+
+Команда copy — самая быстрая из всех, что мы когда-либо видели! При использовании COPY процесс завершился менее чем за секунду. Однако кажется, что этот метод гораздо более расточителен с точки зрения использования памяти. Функция занимает 99 МБ, что более чем в два раза превышает размер нашего файла JSON на диске.
+
 ### Копирование данных из строкового итератора (copy\_from)
+
+Одним из основных недостатков использования копирования с помощью StringIO является то, что весь файл создается в памяти. Что, если вместо создания всего файла в памяти мы создадим файлоподобный объект, который будет действовать как буфер между удаленным источником и командой COPY. Буфер будет использовать JSON через итератор, очищать и преобразовывать данные и выводить чистый CSV.
+
+<figure><img src="../../.gitbook/assets/02-fast-load-data-python-postgresql.png" alt=""><figcaption><p>Копирование данных из строкового итератора (yuml.me)</p></figcaption></figure>
+
+Вдохновленные [этим ответом на stackoverflow](https://stackoverflow.com/a/12604375/2000875), мы создали объект, который использует итератор и предоставляет файловый интерфейс:
+
+```python
+from typing import Iterator, Optional
+import io
+
+class StringIteratorIO(io.TextIOBase):
+    def __init__(self, iter: Iterator[str]):
+        self._iter = iter
+        self._buff = ''
+
+    def readable(self) -> bool:
+        return True
+
+    def _read1(self, n: Optional[int] = None) -> str:
+        while not self._buff:
+            try:
+                self._buff = next(self._iter)
+            except StopIteration:
+                break
+        ret = self._buff[:n]
+        self._buff = self._buff[len(ret):]
+        return ret
+
+    def read(self, n: Optional[int] = None) -> str:
+        line = []
+        if n is None or n < 0:
+            while True:
+                m = self._read1()
+                if not m:
+                    break
+                line.append(m)
+        else:
+            while n > 0:
+                m = self._read1(n)
+                if not m:
+                    break
+                n -= len(m)
+                line.append(m)
+        return ''.join(line)
+```
+
+Чтобы продемонстрировать, как это работает, можно создать объект, подобный файлу CSV, из списка чисел:
+
+```python
+>>> gen = (f'{i},{i**2}\n' for i in range(3))
+>>> gen
+<generator object <genexpr> at 0x7f58bde7f5e8>
+>>> f = StringIteratorIO(gen)
+>>> print(f.read())
+0,0
+1,1
+2,4
+```
+
+Обратите внимание, что мы использовали f как файл. Внутри он извлекал строки из gen только тогда, когда его внутренний буфер строк был пуст.
+
+Функция загрузки с использованием StringIteratorIO выглядит следующим образом:
+
+```python
+@profile
+def copy_string_iterator(connection, beers: Iterator[Dict[str, Any]]) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+        beers_string_iterator = StringIteratorIO((
+            '|'.join(map(clean_csv_value, (
+                beer['id'],
+                beer['name'],
+                beer['tagline'],
+                parse_first_brewed(beer['first_brewed']).isoformat(),
+                beer['description'],
+                beer['image_url'],
+                beer['abv'],
+                beer['ibu'],
+                beer['target_fg'],
+                beer['target_og'],
+                beer['ebc'],
+                beer['srm'],
+                beer['ph'],
+                beer['attenuation_level'],
+                beer['brewers_tips'],
+                beer['contributed_by'],
+                beer['volume']['value'],
+            ))) + '\n'
+            for beer in beers
+        ))
+        cursor.copy_from(beers_string_iterator, 'staging_beers', sep='|')
+```
+
+Основное отличие состоит в том, что CSV-файл beers используется по требованию, и данные не сохраняются в памяти после его использования.
+
+Давайте выполним функцию и посмотрим результаты:
+
+```python
+>>> copy_string_iterator(connection, beers)
+copy_string_iterator()
+Time   0.4596
+Memory 0.0
+```
+
+Большой! Время мало, и память вернулась к нулю.
 
 ### Копирование данных из строкового итератора с размером буфера (copy\_from)
 
