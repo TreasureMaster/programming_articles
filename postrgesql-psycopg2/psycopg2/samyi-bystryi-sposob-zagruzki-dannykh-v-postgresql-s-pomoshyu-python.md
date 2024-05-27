@@ -384,11 +384,198 @@ Memory 0.0234375
 
 На момент написания API пива содержит только 325 сортов пива. Чтобы работать с большим набором данных, мы дублируем его 100 раз и сохраняем в памяти. Результирующий набор данных содержит 32 500 сортов пива:
 
+```python
+>>> beers = list(iter_beers_from_api()) * 100
+>>> len(beers)
+32,500
+```
+
+Чтобы имитировать удаленный API, наши функции будут принимать итераторы, аналогичные возвращаемому значению iter\_beers\_from\_api:
+
+```python
+def process(beers: Iterator[Dict[str, Any]])) -> None:
+    # Process beers...
+```
+
+Для тестирования мы собираемся импортировать данные о пиве в базу данных. Чтобы устранить внешние влияния, такие как сеть, мы заранее получаем данные из API и обслуживаем их локально.
+
+Чтобы получить точное время, мы «подделываем» удаленный API:
+
+```python
+>>> beers = list(iter_beers_from_api()) * 100
+>>> process(beers)
+```
+
+В реальной жизненной ситуации вы бы использовали функцию iter\_beers\_from\_api напрямую:
+
+```python
+>>> process(iter_beers_from_api())
+```
+
+Теперь мы готовы начать!
+
 ### Вставка строк одна за другой (execute)
+
+Чтобы установить базовый уровень, мы начнем с самого простого подхода - вставляем строки одну за другой:
+
+```python
+@profile
+def insert_one_by_one(connection, beers: Iterator[Dict[str, Any]]) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+        for beer in beers:
+            cursor.execute("""
+                INSERT INTO staging_beers VALUES (
+                    %(id)s,
+                    %(name)s,
+                    %(tagline)s,
+                    %(first_brewed)s,
+                    %(description)s,
+                    %(image_url)s,
+                    %(abv)s,
+                    %(ibu)s,
+                    %(target_fg)s,
+                    %(target_og)s,
+                    %(ebc)s,
+                    %(srm)s,
+                    %(ph)s,
+                    %(attenuation_level)s,
+                    %(brewers_tips)s,
+                    %(contributed_by)s,
+                    %(volume)s
+                );
+            """, {
+                **beer,
+                'first_brewed': parse_first_brewed(beer['first_brewed']),
+                'volume': beer['volume']['value'],
+            })
+```
+
+Обратите внимание: при переборе пива мы преобразуем first\_brewed в datetime.date и извлекаем значение объема из вложенного поля объема.
+
+Запуск этой функции дает следующий результат:
+
+```python
+>>> insert_one_by_one(connection, beers)
+insert_one_by_one()
+Time   128.8
+Memory 0.08203125
+```
+
+Для импорта 32 тыс. строк функции потребовалось 129 секунд. Профилировщик памяти показывает, что функция потребляла очень мало памяти.
+
+Интуитивно понятно, что вставка строк одна за другой кажется не очень эффективной. Должно быть, постоянное переключение контекста между программой и базой данных замедляет ее работу.
 
 ### Выполнить много (executemany)
 
+Psycopg2 предоставляет возможность вставлять множество строк одновременно с помощью выполнения [executemany](http://initd.org/psycopg/docs/cursor.html#cursor.executemany). Из документов:
+
+> Выполнить операцию базы данных (запрос или команду) для всех кортежей параметров или сопоставлений, найденных в последовательности vars\_list.
+
+Звучит многообещающе!
+
+Давайте попробуем импортировать данные с помощью executemany:
+
+```python
+@profile
+def insert_executemany(connection, beers: Iterator[Dict[str, Any]]) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+
+        all_beers = [{
+            **beer,
+            'first_brewed': parse_first_brewed(beer['first_brewed']),
+            'volume': beer['volume']['value'],
+        } for beer in beers]
+
+        cursor.executemany("""
+            INSERT INTO staging_beers VALUES (
+                %(id)s,
+                %(name)s,
+                %(tagline)s,
+                %(first_brewed)s,
+                %(description)s,
+                %(image_url)s,
+                %(abv)s,
+                %(ibu)s,
+                %(target_fg)s,
+                %(target_og)s,
+                %(ebc)s,
+                %(srm)s,
+                %(ph)s,
+                %(attenuation_level)s,
+                %(brewers_tips)s,
+                %(contributed_by)s,
+                %(volume)s
+            );
+        """, all_beers)
+```
+
+Функция внешне очень похожа на предыдущую функцию, и преобразования такие же. Основное отличие здесь в том, что мы сначала преобразуем все данные в памяти и только потом импортируем их в базу данных.
+
+Запуск этой функции дает следующий результат:
+
+```python
+>>> insert_executemany(connection, beers)
+insert_executemany()
+Time   124.7
+Memory 2.765625
+```
+
+Это разочаровывает. Время стало немного лучше, но теперь функция потребляет 2,7 МБ памяти.
+
+Чтобы оценить использование памяти, файл JSON, содержащий только импортируемые нами данные, весит на диске 25 МБ. Учитывая пропорции, использование этого метода для импорта файла размером 1 ГБ потребует 110 МБ памяти.
+
 ### Выполнить много из итератора (executemany)
+
+Предыдущий метод потреблял много памяти, поскольку преобразованные данные сохранялись в памяти до обработки psycopg.
+
+Давайте посмотрим, можем ли мы использовать итератор, чтобы избежать хранения данных в памяти:
+
+```python
+@profile
+def insert_executemany_iterator(connection, beers: Iterator[Dict[str, Any]]) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+        cursor.executemany("""
+            INSERT INTO staging_beers VALUES (
+                %(id)s,
+                %(name)s,
+                %(tagline)s,
+                %(first_brewed)s,
+                %(description)s,
+                %(image_url)s,
+                %(abv)s,
+                %(ibu)s,
+                %(target_fg)s,
+                %(target_og)s,
+                %(ebc)s,
+                %(srm)s,
+                %(ph)s,
+                %(attenuation_level)s,
+                %(brewers_tips)s,
+                %(contributed_by)s,
+                %(volume)s
+            );
+        """, ({
+            **beer,
+            'first_brewed': parse_first_brewed(beer['first_brewed']),
+            'volume': beer['volume']['value'],
+        } for beer in beers))
+```
+
+Разница здесь в том, что преобразованные данные «передаются в поток» в метод выполнения с помощью итератора.
+
+Эта функция дает следующий результат:
+
+```python
+>>> insert_executemany_iterator(connection, beers)
+insert_executemany_iterator()
+Time   129.3
+Memory 0.0
+```
+
+Наше «потоковое» решение сработало как положено, и нам удалось свести объем памяти к нулю. Однако сроки остаются примерно такими же, даже по сравнению с методом «один за другим».
 
 ### Выполнить пакетно (execute\_batch)
 
