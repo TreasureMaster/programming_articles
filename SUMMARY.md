@@ -60,3 +60,4 @@
 
 * [psycopg2](postrgesql-psycopg2/psycopg2/README.md)
   * [Улучшение нескольких INSERT с помощью Psycopg2](postrgesql-psycopg2/psycopg2/uluchshenie-neskolkikh-insert-s-pomoshyu-psycopg2.md)
+  * [Page](postrgesql-psycopg2/psycopg2/page.md)
