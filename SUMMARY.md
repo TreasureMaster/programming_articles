@@ -55,3 +55,8 @@
   * [Понимание создания объектов и метаклассов](python/metaclass/ponimanie-sozdaniya-obektov-i-metaklassov.md)
 * [typing, overload](python/typing-overload/README.md)
   * [Правильный способ перегрузки функций в Python](python/typing-overload/pravilnyi-sposob-peregruzki-funkcii-v-python.md)
+
+## PostrgeSQL, psycopg2
+
+* [psycopg2](postrgesql-psycopg2/psycopg2/README.md)
+  * [Улучшение нескольких INSERT с помощью Psycopg2](postrgesql-psycopg2/psycopg2/uluchshenie-neskolkikh-insert-s-pomoshyu-psycopg2.md)
