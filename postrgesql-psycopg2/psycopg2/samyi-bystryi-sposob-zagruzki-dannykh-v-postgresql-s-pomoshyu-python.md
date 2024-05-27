@@ -48,7 +48,7 @@ _**В этой статье мы рассмотрим лучший способ 
   * [Копирование данных из строкового итератора (copy\_from)](samyi-bystryi-sposob-zagruzki-dannykh-v-postgresql-s-pomoshyu-python.md#kopirovanie-dannykh-iz-strokovogo-iteratora-copy\_from)
   * [Копирование данных из строкового итератора с размером буфера (copy\_from)](samyi-bystryi-sposob-zagruzki-dannykh-v-postgresql-s-pomoshyu-python.md#kopirovanie-dannykh-iz-strokovogo-iteratora-s-razmerom-bufera-copy\_from)
 * [Сводка результатов](samyi-bystryi-sposob-zagruzki-dannykh-v-postgresql-s-pomoshyu-python.md#svodka-rezultatov)
-* [Краткое содержание](samyi-bystryi-sposob-zagruzki-dannykh-v-postgresql-s-pomoshyu-python.md#kratkoe-soderzhanie)
+* [В итоге](samyi-bystryi-sposob-zagruzki-dannykh-v-postgresql-s-pomoshyu-python.md#v-itoge)
 
 
 
@@ -1101,6 +1101,94 @@ Memory 0.0
 
 ### Копирование данных из строкового итератора с размером буфера (copy\_from)
 
+Пытаясь еще немного снизить производительность, мы замечаем, что, как и в случае с page\_size, команда копирования также принимает аналогичный аргумент, называемый size:
+
+> size – размер буфера, используемого для чтения из файла.
+
+Добавим в функцию аргумент size:
+
+```python
+@profile
+def copy_string_iterator(connection, beers: Iterator[Dict[str, Any]], size: int = 8192) -> None:
+    with connection.cursor() as cursor:
+        create_staging_table(cursor)
+        beers_string_iterator = StringIteratorIO((
+            '|'.join(map(clean_csv_value, (
+                beer['id'],
+                beer['name'],
+                beer['tagline'],
+                parse_first_brewed(beer['first_brewed']).isoformat(),
+                beer['description'],
+                beer['image_url'],
+                beer['abv'],
+                beer['ibu'],
+                beer['target_fg'],
+                beer['target_og'],
+                beer['ebc'],
+                beer['srm'],
+                beer['ph'],
+                beer['attenuation_level'],
+                beer['brewers_tips'],
+                beer['contributed_by'],
+                beer['volume']['value'],
+            ))) + '\n'
+            for beer in beers
+        ))
+        cursor.copy_from(beers_string_iterator, 'staging_beers', sep='|', size=size)
+```
+
+Значение размера по умолчанию — 8192, что равно 2 \*\* 13, поэтому мы будем сохранять размеры в степени 2:
+
+```python
+>>> copy_string_iterator(connection, iter(beers), size=1024)
+copy_string_iterator(size=1024)
+Time   0.4536
+Memory 0.0
+
+>>> copy_string_iterator(connection, iter(beers), size=8192)
+copy_string_iterator(size=8192)
+Time   0.4596
+Memory 0.0
+
+>>> copy_string_iterator(connection, iter(beers), size=16384)
+copy_string_iterator(size=16384)
+Time   0.4649
+Memory 0.0
+
+>>> copy_string_iterator(connection, iter(beers), size=65536)
+copy_string_iterator(size=65536)
+Time   0.6171
+Memory 0.0
+```
+
+В отличие от предыдущих примеров, кажется, что компромисса между скоростью и памятью нет. Это имеет смысл, поскольку этот метод был разработан так, чтобы не потреблять память. Однако при изменении размера страницы мы получаем разное время. Для нашего набора данных оптимальным является значение по умолчанию 8192.
+
 ## Сводка результатов
 
-## Краткое содержание
+Краткое изложение результатов:
+
+<table><thead><tr><th width="460">Function</th><th width="146">Time (seconds)</th><th>Memory (MB)</th></tr></thead><tbody><tr><td><code>insert_one_by_one()</code></td><td>128.8</td><td>0.08203125</td></tr><tr><td><code>insert_executemany()</code></td><td>124.7</td><td>2.765625</td></tr><tr><td><code>insert_executemany_iterator()</code></td><td>129.3</td><td>0.0</td></tr><tr><td><code>insert_execute_batch()</code></td><td>3.917</td><td>2.50390625</td></tr><tr><td><code>insert_execute_batch_iterator(page_size=1)</code></td><td>130.2</td><td>0.0</td></tr><tr><td><code>insert_execute_batch_iterator(page_size=100)</code></td><td>4.333</td><td>0.0</td></tr><tr><td><code>insert_execute_batch_iterator(page_size=1000)</code></td><td>2.537</td><td>0.2265625</td></tr><tr><td><code>insert_execute_batch_iterator(page_size=10000)</code></td><td>2.585</td><td>25.4453125</td></tr><tr><td><code>insert_execute_values()</code></td><td>3.666</td><td>4.50390625</td></tr><tr><td><code>insert_execute_values_iterator(page_size=1)</code></td><td>127.4</td><td>0.0</td></tr><tr><td><code>insert_execute_values_iterator(page_size=100)</code></td><td>3.677</td><td>0.0</td></tr><tr><td><code>insert_execute_values_iterator(page_size=1000)</code></td><td>1.468</td><td>0.0</td></tr><tr><td><code>insert_execute_values_iterator(page_size=10000)</code></td><td>1.503</td><td>2.25</td></tr><tr><td><code>copy_stringio()</code></td><td>0.6274</td><td>99.109375</td></tr><tr><td><code>copy_string_iterator(size=1024)</code></td><td>0.4536</td><td>0.0</td></tr><tr><td><code>copy_string_iterator(size=8192)</code></td><td>0.4596</td><td>0.0</td></tr><tr><td><code>copy_string_iterator(size=16384)</code></td><td>0.4649</td><td>0.0</td></tr><tr><td><code>copy_string_iterator(size=65536)</code></td><td>0.6171</td><td>0.0</td></tr></tbody></table>
+
+## В итоге
+
+Теперь большой вопрос: _что мне использовать?_ Как всегда, ответ: «_Это зависит_».
+
+Каждый метод имеет свои преимущества и недостатки и подходит для разных обстоятельств:
+
+> Отдавайте предпочтение встроенным подходам для сложных типов данных.
+
+executemany, execute\_values и execute\_batch позаботятся о преобразовании типов данных Python в типы базы данных. Подходы CSV требуют экранирования.
+
+> Отдавайте предпочтение встроенным подходам для небольших объемов данных.
+
+Встроенные подходы более читабельны и с меньшей вероятностью сломаются в будущем. Если память и время не проблема, будьте проще!
+
+> Предпочитайте подходы copy для больших объемов данных.
+
+Подход копирования copy больше подходит для больших объемов данных, где память может стать проблемой.
+
+{% hint style="info" %}
+**ИСХОДНЫЙ КОД**
+
+Исходный код этого теста можно найти [здесь](https://gist.github.com/hakib/7e723d2c113b947f7920bf55737e4d16).
+{% endhint %}
